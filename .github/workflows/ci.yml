@@ -1,0 +1,165 @@
+name: CI/CD Pipeline
+
+"on":
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  test:
+    name: Run Automated Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_ci_password
+          POSTGRES_DB: devops_db_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Test Suite
+        env:
+          DATABASE_URL: postgresql://postgres:postgres_ci_password@localhost:5432/devops_db_test
+          APP_NAME: "DevOps CI Service"
+          APP_ENV: test
+          DEBUG: "False"
+        run: |
+          pytest -v
+
+  build-and-push:
+    name: Build & Push Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Authenticate to Docker Hub using GitHub Secrets (only on push to main/master)
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Build and push container image to Docker Hub
+      - name: Build & Push Application Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/devops-item-service:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/devops-item-service:${{ github.sha }}
+
+  deploy:
+    name: Deploy to AWS EC2
+    needs: build-and-push
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Transfer docker-compose.yml to EC2 instance
+      - name: Copy docker-compose.yml to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "docker-compose.yml"
+          target: "~/app"
+
+      # Execute remote deployment commands on EC2 via SSH
+      - name: Deploy on EC2 via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/devops-item-service:${{ github.sha }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: DOCKER_IMAGE,POSTGRES_PASSWORD
+          script: |
+            set -e
+            mkdir -p ~/app
+            cd ~/app
+
+            if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+              echo "POSTGRES_PASSWORD secret is required for deployment."
+              exit 1
+            fi
+
+            # Securely write deployment environment variables to ~/app/.env
+            # Keep the password out of logs while writing it only to the remote file.
+            {
+              printf 'DOCKER_IMAGE=%s\n' "${DOCKER_IMAGE}"
+              printf 'POSTGRES_USER=postgres\n'
+              printf 'POSTGRES_PASSWORD=%s\n' "${POSTGRES_PASSWORD}"
+              printf 'POSTGRES_DB=devops_db\n'
+              printf 'APP_NAME=DevOps Item Service\n'
+              printf 'APP_ENV=production\n'
+              printf 'DEBUG=False\n'
+              printf 'PORT=8000\n'
+            } > .env
+
+            # Restrict file permissions for .env on the remote server
+            chmod 600 .env
+
+            echo "Pulling latest application image: ${DOCKER_IMAGE}..."
+            docker compose pull api
+
+            echo "Deploying containers without local build..."
+            docker compose up -d --no-build
+
+            echo "Listing container status..."
+            docker compose ps
+
+            echo "Waiting for services to become healthy..."
+            for i in $(seq 1 12); do
+              if curl -s --fail http://localhost:8000/health > /dev/null; then
+                echo "Health check passed on attempt $i!"
+                break
+              fi
+              echo "Health check attempt $i failed, waiting 5 seconds..."
+              sleep 5
+              if [ "$i" -eq 12 ]; then
+                echo "Deployment health check failed after 12 attempts!"
+                docker compose logs --tail 30
+                exit 1
+              fi
+            done
+
+            echo "Deployment successfully verified!"
